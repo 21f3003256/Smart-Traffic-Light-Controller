@@ -53,3 +53,18 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# STM32CubeIDE folders
+Debug/
+Release/
+
+# Eclipse/STM32CubeIDE settings
+.metadata/
+.settings/
+
+# Temporary logs
+*.log
+
+# OS-generated files
+.DS_Store
+Thumbs.db
