@@ -2,5 +2,5 @@ Smart Adaptive traffic light system for a four-way junction is implemented that 
 
 #Team Members: 
 Jiong Sin 
-Chin Chun 
+Chun Yee
 Dev Verma
