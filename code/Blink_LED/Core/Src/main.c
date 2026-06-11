@@ -1,49 +1,33 @@
-/* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
-#include "main.h"
-
-void SystemClock_Config(void);
-/**
- * Two HC-SR04 Ultrasonic Sensors + Traffic Light LED Control
+ * Two HC-SR04 Sensors + Traffic Light + 7-Segment Countdown Display
  * Timer-based state machine using TIM2 interrupt
+ * 7-Segment synced directly to TIM2 counter — no TIM3 needed
  * Target: STM32 Cortex-M4 (NUCLEO-F446RE)
  *
  * Wiring:
- *   Sensor 1 (Near):  TRIG -> PA10,  ECHO -> PA9
- *   Sensor 2 (Far):   TRIG -> PA2,   ECHO -> PA3
+ *   Sensor 1 (Near): TRIG -> PA10, ECHO -> PA9
+ *   Sensor 2 (Far):  TRIG -> PA8,  ECHO -> PB5
  *
- *   RED LED    -> PB0
- *   YELLOW LED -> PB1
- *   GREEN LED  -> PB2
+ *   Traffic LEDs:
+ *   RED LED    -> PA7
+ *   YELLOW LED -> PA6
+ *   GREEN LED  -> PA5
  *
- * How it works:
- *   TIM2 fires an interrupt after a set duration.
- *   Each interrupt advances the light to the next state.
- *   CPU is free between interrupts to read sensors.
- *
- * State machine:
- *   RED -> GREEN (duration based on traffic) -> YELLOW -> RED -> ...
+ *   7-Segment (common cathode):
+ *   SEG_A -> PC0   (fill in your pin)
+ *   SEG_B -> PC1   (fill in your pin)
+ *   SEG_C -> PC2   (fill in your pin)
+ *   SEG_D -> PC3   (fill in your pin)
+ *   SEG_E -> PC4   (fill in your pin)
+ *   SEG_F -> PC5   (fill in your pin)
+ *   SEG_G -> PC6   (fill in your pin)
  */
 
+#include "main.h"
 #include "stm32f4xx_hal.h"
 #include "stm32f4xx_hal_tim.h"
+
+void SystemClock_Config(void);
 
 /* ── Sensor 1 pins (near) ── */
 #define TRIG1_PIN    GPIO_PIN_10
@@ -51,30 +35,41 @@ void SystemClock_Config(void);
 #define ECHO1_PIN    GPIO_PIN_9
 #define ECHO1_PORT   GPIOA
 
-/* ── Sensor 2 pins (far sensor) ── */
-#define TRIG2_PIN    GPIO_PIN_4
-#define TRIG2_PORT   GPIOB
-#define ECHO2_PIN    GPIO_PIN_3
+/* ── Sensor 2 pins (far) ── */
+#define TRIG2_PIN    GPIO_PIN_8
+#define TRIG2_PORT   GPIOA
+#define ECHO2_PIN    GPIO_PIN_5
 #define ECHO2_PORT   GPIOB
 
-/* ── LED pins ── */
+/* ── Traffic LED pins ── */
 #define RED_PIN      GPIO_PIN_7
 #define YELLOW_PIN   GPIO_PIN_6
 #define GREEN_PIN    GPIO_PIN_5
 #define LED_PORT     GPIOA
 
-/* ── Detection thresholds ── */
-#define SENSOR1_THRESHOLD   10    /* Near sensor: object within 150cm */
-#define SENSOR2_THRESHOLD   10    /* Far sensor:  object within 300cm */
+/* ── 7-Segment pins — fill in your port and pins ── */
+#define SEG_PORT     GPIOC
+#define SEG_A        GPIO_PIN_9
+#define SEG_B        GPIO_PIN_8
+#define SEG_C        GPIO_PIN_6
+#define SEG_D        GPIO_PIN_5
+#define SEG_E        GPIO_PIN_7
+#define SEG_F        GPIO_PIN_4
+#define SEG_G        GPIO_PIN_11
+#define SEG_ALL      (SEG_A|SEG_B|SEG_C|SEG_D|SEG_E|SEG_F|SEG_G)
+
+/* ── Detection thresholds (cm) ── */
+#define SENSOR1_THRESHOLD   10
+#define SENSOR2_THRESHOLD   10
 
 /* ── Green light durations (ms) ── */
-#define GREEN_NORMAL        2000
-#define GREEN_LOW           4000
-#define GREEN_HEAVY         6000
+#define GREEN_NORMAL        5000    /* No traffic:    5 seconds */
+#define GREEN_LOW           7000    /* Low traffic:   7 seconds */
+#define GREEN_HEAVY         9000    /* Heavy traffic: 9 seconds */
 
 /* ── Transition durations (ms) ── */
-#define YELLOW_DURATION     2000
-#define RED_DURATION        1000
+#define YELLOW_DURATION     3000    /* Yellow: 3 seconds */
+#define RED_DURATION        4000    /* Red:    2 seconds */
 
 /* ── Traffic states ── */
 typedef enum {
@@ -93,8 +88,9 @@ typedef enum {
 /* ── Global variables ── */
 TIM_HandleTypeDef htim2;
 volatile LightState current_light = LIGHT_RED;
-volatile uint8_t    timer_expired  = 0;
-TrafficState        traffic        = NO_TRAFFIC;
+volatile uint8_t    timer_expired = 0;
+volatile uint32_t   current_phase_ms = 0;   /* Total ms of current phase  */
+TrafficState        traffic = NO_TRAFFIC;
 
 /* ────────────────────────────────────────────
    DWT microsecond timer
@@ -114,49 +110,43 @@ void delay_us(uint32_t us)
 }
 
 /* ────────────────────────────────────────────
-   TIM2 setup
-   Prescaler set so timer ticks every 1ms.
-   Period set to desired duration, then timer fires interrupt.
+   TIM2 — light phase timer (one-shot)
    ──────────────────────────────────────────── */
 void TIM2_Init(void)
 {
     __HAL_RCC_TIM2_CLK_ENABLE();
-
-    /* Tick every 1ms: prescaler = (SystemCoreClock / 1000) - 1 */
     htim2.Instance               = TIM2;
-    htim2.Init.Prescaler         = (HAL_RCC_GetHCLKFreq() / 1000) - 1;
+    htim2.Init.Prescaler         = (HAL_RCC_GetHCLKFreq() / 100) - 1;
     htim2.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim2.Init.Period            = 0xFFFFFFFF; /* Set properly before start */
+    htim2.Init.Period            = 0xFFFFFFFF;
     htim2.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
     htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
     HAL_TIM_Base_Init(&htim2);
-
     HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(TIM2_IRQn);
 }
 
-/* Start timer for a given duration in milliseconds */
 void Timer_Start(uint32_t duration_ms)
 {
-    HAL_TIM_Base_Stop_IT(&htim2);        /* Stop any running timer first  */
-    __HAL_TIM_SET_COUNTER(&htim2, 0);    /* Reset counter to 0            */
-    __HAL_TIM_SET_AUTORELOAD(&htim2, duration_ms - 1); /* Set period      */
-    timer_expired = 0;
-    HAL_TIM_Base_Start_IT(&htim2);       /* Start, fires interrupt at end */
+    HAL_TIM_Base_Stop_IT(&htim2);
+    __HAL_TIM_SET_COUNTER(&htim2, 0);
+    __HAL_TIM_SET_AUTORELOAD(&htim2, duration_ms - 1);
+    current_phase_ms = duration_ms;       /* Save total duration           */
+    timer_expired    = 0;
+    HAL_TIM_Base_Start_IT(&htim2);
 }
 
-/* TIM2 interrupt handler — called when timer period elapses */
+/* ── TIM2 IRQ handler ── */
 void TIM2_IRQHandler(void)
 {
     HAL_TIM_IRQHandler(&htim2);
 }
 
-/* HAL timer period elapsed callback */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM2) {
-        HAL_TIM_Base_Stop_IT(&htim2);  /* Stop timer, one-shot behavior  */
-        timer_expired = 1;             /* Signal main loop                */
+        HAL_TIM_Base_Stop_IT(&htim2);
+        timer_expired = 1;
     }
 }
 
@@ -167,6 +157,7 @@ void GPIO_Init(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
 
     GPIO_InitTypeDef gpio = {0};
 
@@ -183,38 +174,69 @@ void GPIO_Init(void)
     gpio.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(ECHO1_PORT, &gpio);
 
-    /* PA2 — Sensor 2 TRIG */
+    /* PA8 — Sensor 2 TRIG */
     gpio.Pin   = TRIG2_PIN;
     gpio.Mode  = GPIO_MODE_OUTPUT_PP;
     gpio.Pull  = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(TRIG2_PORT, &gpio);
 
-    /* PA3 — Sensor 2 ECHO */
+    /* PB5 — Sensor 2 ECHO */
     gpio.Pin  = ECHO2_PIN;
     gpio.Mode = GPIO_MODE_INPUT;
     gpio.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(ECHO2_PORT, &gpio);
 
-    /* PB0, PB1, PB2 — RED, YELLOW, GREEN LEDs */
+    /* PA5, PA6, PA7 — GREEN, YELLOW, RED LEDs */
     gpio.Pin   = RED_PIN | YELLOW_PIN | GREEN_PIN;
     gpio.Mode  = GPIO_MODE_OUTPUT_PP;
     gpio.Pull  = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(LED_PORT, &gpio);
 
-    gpio.Pin   = GPIO_PIN_8 | GPIO_PIN_6;
+    /* 7-Segment pins */
+    gpio.Pin   = SEG_ALL;
+    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull  = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(SEG_PORT, &gpio);
+
+    /* Debug indicator PB6 PB8 */
+    gpio.Pin   = GPIO_PIN_6 | GPIO_PIN_8;
     gpio.Mode  = GPIO_MODE_OUTPUT_PP;
     gpio.Pull  = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &gpio);
 
-    /* All TRIG pins LOW, all LEDs off */
+    /* All outputs start LOW */
     HAL_GPIO_WritePin(TRIG1_PORT, TRIG1_PIN, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(TRIG2_PORT, TRIG2_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_PORT, RED_PIN | YELLOW_PIN | GREEN_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LED_PORT,   RED_PIN | YELLOW_PIN | GREEN_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEG_PORT,   SEG_ALL, GPIO_PIN_RESET);
 
     DWT_Init();
+}
+
+/* ────────────────────────────────────────────
+   7-Segment digit encoding (common cathode)
+   ──────────────────────────────────────────── */
+void SEG_Display(uint8_t digit)
+{
+    HAL_GPIO_WritePin(SEG_PORT, SEG_ALL, GPIO_PIN_RESET);
+
+    switch (digit) {
+        case 0: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_C|SEG_D|SEG_E|SEG_F, GPIO_PIN_SET); break;
+        case 1: HAL_GPIO_WritePin(SEG_PORT, SEG_B|SEG_C,                           GPIO_PIN_SET); break;
+        case 2: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_D|SEG_E|SEG_G,        GPIO_PIN_SET); break;
+        case 3: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_C|SEG_D|SEG_G,        GPIO_PIN_SET); break;
+        case 4: HAL_GPIO_WritePin(SEG_PORT, SEG_B|SEG_C|SEG_F|SEG_G,              GPIO_PIN_SET); break;
+        case 5: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_C|SEG_D|SEG_F|SEG_G,        GPIO_PIN_SET); break;
+        case 6: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_C|SEG_D|SEG_E|SEG_F|SEG_G,  GPIO_PIN_SET); break;
+        case 7: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_C,                     GPIO_PIN_SET); break;
+        case 8: HAL_GPIO_WritePin(SEG_PORT, SEG_ALL,                               GPIO_PIN_SET); break;
+        case 9: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_C|SEG_D|SEG_F|SEG_G,  GPIO_PIN_SET); break;
+        default: HAL_GPIO_WritePin(SEG_PORT, SEG_ALL, GPIO_PIN_RESET); break;
+    }
 }
 
 /* ────────────────────────────────────────────
@@ -247,32 +269,28 @@ uint32_t Ultrasonic_ReadCm(GPIO_TypeDef *trig_port, uint16_t trig_pin,
 
 /* ────────────────────────────────────────────
    Read both sensors, return traffic state
-   Called during RED phase so data is ready
-   before GREEN starts
    ──────────────────────────────────────────── */
 TrafficState ReadTraffic(void)
 {
     uint32_t dist1 = Ultrasonic_ReadCm(TRIG1_PORT, TRIG1_PIN,
                                         ECHO1_PORT, ECHO1_PIN);
-    HAL_Delay(60);  /* 60ms gap between sensors to avoid crosstalk */
+    HAL_Delay(60);
 
     uint32_t dist2 = Ultrasonic_ReadCm(TRIG2_PORT, TRIG2_PIN,
                                         ECHO2_PORT, ECHO2_PIN);
 
     uint8_t count = 0;
     if (dist1 < SENSOR1_THRESHOLD) {
-    	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
-    	count++;
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+        count++;
+    } else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
     }
-    else {
-    	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
-    }
-    if (dist2 < SENSOR2_THRESHOLD){
-    	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
-    	count++;
-    }
-    else{
-    	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+    if (dist2 < SENSOR2_THRESHOLD) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+        count++;
+    } else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
     }
 
     if      (count == 2) return HIGH_TRAFFIC;
@@ -302,6 +320,19 @@ void LED_Green(void)
 }
 
 /* ────────────────────────────────────────────
+   Get remaining seconds from TIM2 directly
+   Perfectly synced — same timer as the light
+   ──────────────────────────────────────────── */
+uint8_t Get_Remaining_Seconds(void)
+{
+    uint32_t elapsed_ms   = __HAL_TIM_GET_COUNTER(&htim2);
+    uint32_t remaining_ms = (current_phase_ms > elapsed_ms)
+                            ? (current_phase_ms - elapsed_ms)
+                            : 0;
+    return (uint8_t)(remaining_ms / 1000);
+}
+
+/* ────────────────────────────────────────────
    Main
    ──────────────────────────────────────────── */
 int main(void)
@@ -311,25 +342,31 @@ int main(void)
     GPIO_Init();
     TIM2_Init();
 
-    /* Start on RED, read sensors immediately */
+    /* Start on RED */
     LED_Red();
     traffic = ReadTraffic();
     Timer_Start(RED_DURATION);
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
 
+    uint8_t last_sec = 0xFF;    /* Track last displayed second to avoid
+                                   redundant GPIO writes                   */
 
     while (1)
     {
-        /* Wait here until TIM2 fires */
+        /* ── Update 7-seg display from TIM2 counter ── */
+        uint8_t remaining = Get_Remaining_Seconds();
+        if (remaining != last_sec) {
+            last_sec = remaining;
+            SEG_Display(remaining % 10);
+        }
+
+        /* ── TIM2 expired → advance light state ── */
         if (timer_expired)
         {
             timer_expired = 0;
+            last_sec      = 0xFF;   /* Force display refresh on new phase  */
 
-            /* Advance to next light state */
             if (current_light == LIGHT_RED)
             {
-                /* RED done — move to GREEN */
-                /* Green duration depends on traffic read during RED */
                 uint32_t green_time;
                 if      (traffic == HIGH_TRAFFIC) green_time = GREEN_HEAVY;
                 else if (traffic == LOW_TRAFFIC)  green_time = GREEN_LOW;
@@ -341,150 +378,62 @@ int main(void)
             }
             else if (current_light == LIGHT_GREEN)
             {
-                /* GREEN done — move to YELLOW */
                 current_light = LIGHT_YELLOW;
                 LED_Yellow();
                 Timer_Start(YELLOW_DURATION);
             }
             else if (current_light == LIGHT_YELLOW)
             {
-                /* YELLOW done — move to RED */
-                /* Read sensors NOW during RED so data is
-                   ready for the next GREEN phase           */
                 current_light = LIGHT_RED;
                 LED_Red();
-                traffic = ReadTraffic();   /* CPU free to do this! */
+                traffic = ReadTraffic();
                 Timer_Start(RED_DURATION);
             }
         }
-
-        /* CPU is free here — add other tasks if needed */
     }
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
+/* ────────────────────────────────────────────
+   System Clock Configuration
+   ──────────────────────────────────────────── */
 void SystemClock_Config(void)
 {
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
-  __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
-  RCC_OscInitStruct.PLL.PLLR = 2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM            = 16;
+    RCC_OscInitStruct.PLL.PLLN            = 336;
+    RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV4;
+    RCC_OscInitStruct.PLL.PLLQ            = 2;
+    RCC_OscInitStruct.PLL.PLLR            = 2;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) { Error_Handler(); }
 }
 
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : LD2_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
-}
-
-/* USER CODE BEGIN 4 */
-
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
+/* ────────────────────────────────────────────
+   Error Handler
+   ──────────────────────────────────────────── */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+    __disable_irq();
+    while (1) {}
 }
+
 #ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
+void assert_failed(uint8_t *file, uint32_t line) {}
+#endif
