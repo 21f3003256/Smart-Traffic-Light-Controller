@@ -1,401 +1,359 @@
 /**
- * Two HC-SR04 Sensors + Traffic Light + 7-Segment Countdown Display
- * Timer-based state machine using TIM2 interrupt
- * 7-Segment synced directly to TIM2 counter — no TIM3 needed
- * Target: STM32 Cortex-M4 (NUCLEO-F446RE)
+ * 4-Way Traffic Management System — NUCLEO-F446RE
+ * (Final build, 7-segment display omitted)
  *
- * Wiring:
- *   Sensor 1 (Near): TRIG -> PA10, ECHO -> PA9
- *   Sensor 2 (Far):  TRIG -> PA8,  ECHO -> PB5
+ * Subsystems:
+ *   - 4 traffic lights (R/Y/G per direction)            : 12 GPIO
+ *   - 4 pedestrian push buttons (active HIGH, EXTI)     :  4 GPIO
+ *   - 8 HC-SR04 sensors (4 dir x 2 near/far, 1 TRIG)    :  9 GPIO
  *
- *   Traffic LEDs:
- *   RED LED    -> PA7
- *   YELLOW LED -> PA6
- *   GREEN LED  -> PA5
+ * Cycle: N -> E -> S -> W -> N ...
+ * Per direction: RED (sample sensors) -> GREEN -> YELLOW -> next direction.
+ * Other directions are held at RED throughout.
  *
- *   7-Segment (common cathode):
- *   SEG_A -> PC0   (fill in your pin)
- *   SEG_B -> PC1   (fill in your pin)
- *   SEG_C -> PC2   (fill in your pin)
- *   SEG_D -> PC3   (fill in your pin)
- *   SEG_E -> PC4   (fill in your pin)
- *   SEG_F -> PC5   (fill in your pin)
- *   SEG_G -> PC6   (fill in your pin)
+ * Green duration adapts to sensor occupancy:
+ *   0 blocked -> 5 s   1 blocked -> 7 s   2 blocked -> 9 s
+ * Pressing a direction's pedestrian button before its RED phase extends
+ * that RED by PED_EXTEND_MS (extra crossing time).
+ *
+ * Sensor reading uses median-of-3 with 60 ms settle delay between firings
+ * to reject single-shot spikes and acoustic crosstalk from the shared TRIG.
  */
 
 #include "main.h"
 #include "stm32f4xx_hal.h"
-#include "stm32f4xx_hal_tim.h"
 
 void SystemClock_Config(void);
 
-/* ── Sensor 1 pins (near) ── */
-#define TRIG1_PIN    GPIO_PIN_10
-#define TRIG1_PORT   GPIOA
-#define ECHO1_PIN    GPIO_PIN_9
-#define ECHO1_PORT   GPIOA
+/* ============================================================ */
+/*  Directions / timing                                         */
+/* ============================================================ */
+#define DIR_N    0
+#define DIR_E    1
+#define DIR_S    2
+#define DIR_W    3
+#define NUM_DIRS 4
 
-/* ── Sensor 2 pins (far) ── */
-#define TRIG2_PIN    GPIO_PIN_8
-#define TRIG2_PORT   GPIOA
-#define ECHO2_PIN    GPIO_PIN_5
-#define ECHO2_PORT   GPIOB
+#define GREEN_NORMAL_MS  2000u    /* 0 blocked -> 2 blinks (car-free)   */
+#define GREEN_LOW_MS     5000u    /* 1 blocked -> 5 blinks (light)      */
+#define GREEN_HEAVY_MS  10000u    /* 2 blocked -> 10 blinks (heavy)     */
+#define YELLOW_MS        3000u
+#define RED_MS           2000u
+#define PED_EXTEND_MS    3000u
 
-/* ── Traffic LED pins ── */
-#define RED_PIN      GPIO_PIN_7
-#define YELLOW_PIN   GPIO_PIN_6
-#define GREEN_PIN    GPIO_PIN_5
-#define LED_PORT     GPIOA
+#define SENSOR_TIMEOUT_US   30000u
+#define SENSOR_SETTLE_MS    60u
+#define NOISE_FLOOR_CM      2u   /* readings below this are treated as noise */
 
-/* ── 7-Segment pins — fill in your port and pins ── */
-#define SEG_PORT     GPIOC
-#define SEG_A        GPIO_PIN_9
-#define SEG_B        GPIO_PIN_8
-#define SEG_C        GPIO_PIN_6
-#define SEG_D        GPIO_PIN_5
-#define SEG_E        GPIO_PIN_7
-#define SEG_F        GPIO_PIN_4
-#define SEG_G        GPIO_PIN_11
-#define SEG_ALL      (SEG_A|SEG_B|SEG_C|SEG_D|SEG_E|SEG_F|SEG_G)
+/* Per-direction trigger distance (cm). */
+static const uint16_t SENSOR_THRESHOLD_CM[NUM_DIRS] = {
+    3,   /* N */
+    3,   /* E */
+    3,   /* S */
+    3,   /* W */
+};
 
-/* ── Detection thresholds (cm) ── */
-#define SENSOR1_THRESHOLD   10
-#define SENSOR2_THRESHOLD   10
+/* ============================================================ */
+/*  Pin map                                                     */
+/* ============================================================ */
+typedef struct { GPIO_TypeDef *port; uint16_t pin; } GpioPin;
 
-/* ── Green light durations (ms) ── */
-#define GREEN_NORMAL        5000    /* No traffic:    5 seconds */
-#define GREEN_LOW           7000    /* Low traffic:   7 seconds */
-#define GREEN_HEAVY         9000    /* Heavy traffic: 9 seconds */
+static const GpioPin LED_RED[NUM_DIRS] = {
+    { GPIOA, GPIO_PIN_7  },
+    { GPIOB, GPIO_PIN_6  },
+    { GPIOA, GPIO_PIN_8  },
+    { GPIOB, GPIO_PIN_5  },
+};
+static const GpioPin LED_YEL[NUM_DIRS] = {
+    { GPIOA, GPIO_PIN_6  },
+    { GPIOC, GPIO_PIN_7  },
+    { GPIOB, GPIO_PIN_10 },
+    { GPIOB, GPIO_PIN_3  },
+};
+static const GpioPin LED_GRN[NUM_DIRS] = {
+    { GPIOA, GPIO_PIN_5  },
+    { GPIOA, GPIO_PIN_9  },
+    { GPIOB, GPIO_PIN_4  },
+    { GPIOA, GPIO_PIN_10 },
+};
 
-/* ── Transition durations (ms) ── */
-#define YELLOW_DURATION     3000    /* Yellow: 3 seconds */
-#define RED_DURATION        4000    /* Red:    2 seconds */
+#define TRIG_PORT   GPIOB
+#define TRIG_PIN    GPIO_PIN_0
 
-/* ── Traffic states ── */
-typedef enum {
-    NO_TRAFFIC   = 0,
-    LOW_TRAFFIC  = 1,
-    HIGH_TRAFFIC = 2
-} TrafficState;
+static const GpioPin ECHO_NEAR[NUM_DIRS] = {
+    { GPIOB, GPIO_PIN_7  },
+    { GPIOB, GPIO_PIN_12 },
+    { GPIOB, GPIO_PIN_14 },
+    { GPIOA, GPIO_PIN_11 },
+};
+static const GpioPin ECHO_FAR[NUM_DIRS] = {
+    { GPIOC, GPIO_PIN_12 },
+    { GPIOB, GPIO_PIN_13 },
+    { GPIOB, GPIO_PIN_15 },
+    { GPIOA, GPIO_PIN_12 },
+};
 
-/* ── Light states ── */
-typedef enum {
-    LIGHT_RED    = 0,
-    LIGHT_GREEN  = 1,
-    LIGHT_YELLOW = 2
-} LightState;
+/* Buttons remapped so each physical button controls its own direction
+ * (N<->S and E<->W swapped relative to pinlist rev 2). */
+static const GpioPin BTN[NUM_DIRS] = {
+    { GPIOA, GPIO_PIN_4 },   /* N - EXTI4   (was S pin) */
+    { GPIOB, GPIO_PIN_8 },   /* E - EXTI9_5 (was W pin) */
+    { GPIOA, GPIO_PIN_0 },   /* S - EXTI0   (was N pin) */
+    { GPIOA, GPIO_PIN_1 },   /* W - EXTI1   (was E pin) */
+};
+static volatile uint8_t ped_pending[NUM_DIRS] = {0};
 
-/* ── Global variables ── */
-TIM_HandleTypeDef htim2;
-volatile LightState current_light = LIGHT_RED;
-volatile uint8_t    timer_expired = 0;
-volatile uint32_t   current_phase_ms = 0;   /* Total ms of current phase  */
-TrafficState        traffic = NO_TRAFFIC;
+/* ============================================================ */
+/*  Microsecond timer (DWT cycle counter)                       */
+/* ============================================================ */
+static uint32_t cycles_per_us;
 
-/* ────────────────────────────────────────────
-   DWT microsecond timer
-   ──────────────────────────────────────────── */
-void DWT_Init(void)
-{
+static inline uint32_t micros(void) { return DWT->CYCCNT / cycles_per_us; }
+static inline void delay_us(uint32_t us) {
+    uint32_t s = DWT->CYCCNT, t = us * cycles_per_us;
+    while ((DWT->CYCCNT - s) < t) { }
+}
+static void DWT_Init(void) {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT       = 0;
     DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;
+    cycles_per_us     = HAL_RCC_GetHCLKFreq() / 1000000u;
 }
 
-void delay_us(uint32_t us)
-{
-    uint32_t start = DWT->CYCCNT;
-    uint32_t ticks = us * (HAL_RCC_GetHCLKFreq() / 1000000U);
-    while ((DWT->CYCCNT - start) < ticks);
+/* ============================================================ */
+/*  GPIO helpers                                                */
+/* ============================================================ */
+static inline void pin_write(GpioPin p, GPIO_PinState s) {
+    HAL_GPIO_WritePin(p.port, p.pin, s);
+}
+static inline GPIO_PinState pin_read(GpioPin p) {
+    return HAL_GPIO_ReadPin(p.port, p.pin);
+}
+static void gpio_out(GPIO_TypeDef *port, uint16_t pin) {
+    GPIO_InitTypeDef g = {0};
+    g.Pin = pin; g.Mode = GPIO_MODE_OUTPUT_PP;
+    g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(port, &g);
+    HAL_GPIO_WritePin(port, pin, GPIO_PIN_RESET);
+}
+static void gpio_in_pulldown(GPIO_TypeDef *port, uint16_t pin) {
+    GPIO_InitTypeDef g = {0};
+    g.Pin = pin; g.Mode = GPIO_MODE_INPUT;
+    g.Pull = GPIO_PULLDOWN; g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(port, &g);
+}
+static void gpio_exti_rising(GPIO_TypeDef *port, uint16_t pin) {
+    GPIO_InitTypeDef g = {0};
+    g.Pin = pin; g.Mode = GPIO_MODE_IT_RISING;
+    g.Pull = GPIO_PULLDOWN; g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(port, &g);
 }
 
-/* ────────────────────────────────────────────
-   TIM2 — light phase timer (one-shot)
-   ──────────────────────────────────────────── */
-void TIM2_Init(void)
-{
-    __HAL_RCC_TIM2_CLK_ENABLE();
-    htim2.Instance               = TIM2;
-    htim2.Init.Prescaler         = (HAL_RCC_GetHCLKFreq() / 100) - 1;
-    htim2.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim2.Init.Period            = 0xFFFFFFFF;
-    htim2.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    HAL_TIM_Base_Init(&htim2);
-    HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
-    HAL_NVIC_EnableIRQ(TIM2_IRQn);
+/* ============================================================ */
+/*  Traffic LED helpers                                         */
+/* ============================================================ */
+typedef enum { LIGHT_RED = 0, LIGHT_YELLOW, LIGHT_GREEN } LightColor;
+
+static void set_light(uint8_t dir, LightColor c) {
+    pin_write(LED_RED[dir], c == LIGHT_RED    ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    pin_write(LED_YEL[dir], c == LIGHT_YELLOW ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    pin_write(LED_GRN[dir], c == LIGHT_GREEN  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+static void all_red(void) {
+    for (uint8_t d = 0; d < NUM_DIRS; d++) set_light(d, LIGHT_RED);
 }
 
-void Timer_Start(uint32_t duration_ms)
+/* ============================================================ */
+/*  HC-SR04: single ECHO measurement, wraparound-safe           */
+/* ============================================================ */
+static uint16_t read_one_echo(GpioPin echo)
 {
-    HAL_TIM_Base_Stop_IT(&htim2);
-    __HAL_TIM_SET_COUNTER(&htim2, 0);
-    __HAL_TIM_SET_AUTORELOAD(&htim2, duration_ms - 1);
-    current_phase_ms = duration_ms;       /* Save total duration           */
-    timer_expired    = 0;
-    HAL_TIM_Base_Start_IT(&htim2);
+    HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_RESET);
+    delay_us(2);
+    HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_SET);
+    delay_us(11);
+    HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_RESET);
+
+    uint32_t start = micros();
+    while (pin_read(echo) == GPIO_PIN_RESET) {
+        if ((micros() - start) > SENSOR_TIMEOUT_US) return 0;
+    }
+    uint32_t t0 = micros();
+    while (pin_read(echo) == GPIO_PIN_SET) {
+        if ((micros() - t0) > SENSOR_TIMEOUT_US) return 0;
+    }
+    return (uint16_t)((micros() - t0) / 58u);
 }
 
-/* ── TIM2 IRQ handler ── */
-void TIM2_IRQHandler(void)
+/* Median of 3 readings — rejects single-shot spikes. */
+static uint16_t read_echo_median(GpioPin echo)
 {
-    HAL_TIM_IRQHandler(&htim2);
+    uint16_t a = read_one_echo(echo);
+    HAL_Delay(2);
+    uint16_t b = read_one_echo(echo);
+    HAL_Delay(2);
+    uint16_t c = read_one_echo(echo);
+
+    if (a > b) { uint16_t t = a; a = b; b = t; }
+    if (b > c) { uint16_t t = b; b = c; c = t; }
+    if (a > b) { uint16_t t = a; a = b; b = t; }
+    return b;
 }
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+/* Returns count of sensors reading inside the lane threshold (0..2). */
+static uint8_t read_sensor_pair(uint8_t dir)
 {
-    if (htim->Instance == TIM2) {
-        HAL_TIM_Base_Stop_IT(&htim2);
-        timer_expired = 1;
+    uint16_t thr = SENSOR_THRESHOLD_CM[dir];
+
+    uint16_t near_cm = read_echo_median(ECHO_NEAR[dir]);
+    HAL_Delay(SENSOR_SETTLE_MS);
+    uint16_t far_cm  = read_echo_median(ECHO_FAR[dir]);
+    HAL_Delay(SENSOR_SETTLE_MS);
+
+    uint8_t blocked = 0;
+    if (near_cm >= NOISE_FLOOR_CM && near_cm < thr) blocked++;
+    if (far_cm  >= NOISE_FLOOR_CM && far_cm  < thr) blocked++;
+    return blocked;
+}
+
+static uint32_t green_duration(uint8_t blocked) {
+    switch (blocked) {
+        case 0:  return GREEN_NORMAL_MS;
+        case 1:  return GREEN_LOW_MS;
+        default: return GREEN_HEAVY_MS;
     }
 }
 
-/* ────────────────────────────────────────────
-   GPIO init
-   ──────────────────────────────────────────── */
-void GPIO_Init(void)
+/* ============================================================ */
+/*  Init                                                        */
+/* ============================================================ */
+static void GPIO_Init_All(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
-    GPIO_InitTypeDef gpio = {0};
-
-    /* PA10 — Sensor 1 TRIG */
-    gpio.Pin   = TRIG1_PIN;
-    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
-    gpio.Pull  = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(TRIG1_PORT, &gpio);
-
-    /* PA9 — Sensor 1 ECHO */
-    gpio.Pin  = ECHO1_PIN;
-    gpio.Mode = GPIO_MODE_INPUT;
-    gpio.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(ECHO1_PORT, &gpio);
-
-    /* PA8 — Sensor 2 TRIG */
-    gpio.Pin   = TRIG2_PIN;
-    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
-    gpio.Pull  = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(TRIG2_PORT, &gpio);
-
-    /* PB5 — Sensor 2 ECHO */
-    gpio.Pin  = ECHO2_PIN;
-    gpio.Mode = GPIO_MODE_INPUT;
-    gpio.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(ECHO2_PORT, &gpio);
-
-    /* PA5, PA6, PA7 — GREEN, YELLOW, RED LEDs */
-    gpio.Pin   = RED_PIN | YELLOW_PIN | GREEN_PIN;
-    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
-    gpio.Pull  = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(LED_PORT, &gpio);
-
-    /* 7-Segment pins */
-    gpio.Pin   = SEG_ALL;
-    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
-    gpio.Pull  = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(SEG_PORT, &gpio);
-
-    /* Debug indicator PB6 PB8 */
-    gpio.Pin   = GPIO_PIN_6 | GPIO_PIN_8;
-    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
-    gpio.Pull  = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOB, &gpio);
-
-    /* All outputs start LOW */
-    HAL_GPIO_WritePin(TRIG1_PORT, TRIG1_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(TRIG2_PORT, TRIG2_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_PORT,   RED_PIN | YELLOW_PIN | GREEN_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(SEG_PORT,   SEG_ALL, GPIO_PIN_RESET);
-
-    DWT_Init();
-}
-
-/* ────────────────────────────────────────────
-   7-Segment digit encoding (common cathode)
-   ──────────────────────────────────────────── */
-void SEG_Display(uint8_t digit)
-{
-    HAL_GPIO_WritePin(SEG_PORT, SEG_ALL, GPIO_PIN_RESET);
-
-    switch (digit) {
-        case 0: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_C|SEG_D|SEG_E|SEG_F, GPIO_PIN_SET); break;
-        case 1: HAL_GPIO_WritePin(SEG_PORT, SEG_B|SEG_C,                           GPIO_PIN_SET); break;
-        case 2: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_D|SEG_E|SEG_G,        GPIO_PIN_SET); break;
-        case 3: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_C|SEG_D|SEG_G,        GPIO_PIN_SET); break;
-        case 4: HAL_GPIO_WritePin(SEG_PORT, SEG_B|SEG_C|SEG_F|SEG_G,              GPIO_PIN_SET); break;
-        case 5: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_C|SEG_D|SEG_F|SEG_G,        GPIO_PIN_SET); break;
-        case 6: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_C|SEG_D|SEG_E|SEG_F|SEG_G,  GPIO_PIN_SET); break;
-        case 7: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_C,                     GPIO_PIN_SET); break;
-        case 8: HAL_GPIO_WritePin(SEG_PORT, SEG_ALL,                               GPIO_PIN_SET); break;
-        case 9: HAL_GPIO_WritePin(SEG_PORT, SEG_A|SEG_B|SEG_C|SEG_D|SEG_F|SEG_G,  GPIO_PIN_SET); break;
-        default: HAL_GPIO_WritePin(SEG_PORT, SEG_ALL, GPIO_PIN_RESET); break;
-    }
-}
-
-/* ────────────────────────────────────────────
-   Ultrasonic read
-   ──────────────────────────────────────────── */
-uint32_t Ultrasonic_ReadCm(GPIO_TypeDef *trig_port, uint16_t trig_pin,
-                            GPIO_TypeDef *echo_port, uint16_t echo_pin)
-{
-    HAL_GPIO_WritePin(trig_port, trig_pin, GPIO_PIN_RESET);
-    delay_us(2);
-    HAL_GPIO_WritePin(trig_port, trig_pin, GPIO_PIN_SET);
-    delay_us(10);
-    HAL_GPIO_WritePin(trig_port, trig_pin, GPIO_PIN_RESET);
-
-    uint32_t start = DWT->CYCCNT;
-    while (HAL_GPIO_ReadPin(echo_port, echo_pin) == GPIO_PIN_RESET) {
-        if ((DWT->CYCCNT - start) / (HAL_RCC_GetHCLKFreq() / 1000000U) > 30000)
-            return 9999;
+    for (uint8_t d = 0; d < NUM_DIRS; d++) {
+        gpio_out(LED_RED[d].port, LED_RED[d].pin);
+        gpio_out(LED_YEL[d].port, LED_YEL[d].pin);
+        gpio_out(LED_GRN[d].port, LED_GRN[d].pin);
     }
 
-    start = DWT->CYCCNT;
-    while (HAL_GPIO_ReadPin(echo_port, echo_pin) == GPIO_PIN_SET) {
-        if ((DWT->CYCCNT - start) / (HAL_RCC_GetHCLKFreq() / 1000000U) > 30000)
-            return 9999;
+    gpio_out(TRIG_PORT, TRIG_PIN);
+    for (uint8_t d = 0; d < NUM_DIRS; d++) {
+        gpio_in_pulldown(ECHO_NEAR[d].port, ECHO_NEAR[d].pin);
+        gpio_in_pulldown(ECHO_FAR[d].port,  ECHO_FAR[d].pin);
     }
 
-    uint32_t echo_us = (DWT->CYCCNT - start) / (HAL_RCC_GetHCLKFreq() / 1000000U);
-    return (echo_us * 343UL) / 20000UL;
-}
-
-/* ────────────────────────────────────────────
-   Read both sensors, return traffic state
-   ──────────────────────────────────────────── */
-TrafficState ReadTraffic(void)
-{
-    uint32_t dist1 = Ultrasonic_ReadCm(TRIG1_PORT, TRIG1_PIN,
-                                        ECHO1_PORT, ECHO1_PIN);
-    HAL_Delay(60);
-
-    uint32_t dist2 = Ultrasonic_ReadCm(TRIG2_PORT, TRIG2_PIN,
-                                        ECHO2_PORT, ECHO2_PIN);
-
-    uint8_t count = 0;
-    if (dist1 < SENSOR1_THRESHOLD) {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
-        count++;
-    } else {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+    for (uint8_t d = 0; d < NUM_DIRS; d++) {
+        gpio_exti_rising(BTN[d].port, BTN[d].pin);
     }
-    if (dist2 < SENSOR2_THRESHOLD) {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
-        count++;
-    } else {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-    }
-
-    if      (count == 2) return HIGH_TRAFFIC;
-    else if (count == 1) return LOW_TRAFFIC;
-    else                 return NO_TRAFFIC;
+    HAL_NVIC_SetPriority(EXTI0_IRQn,   5, 0);
+    HAL_NVIC_SetPriority(EXTI1_IRQn,   5, 0);
+    HAL_NVIC_SetPriority(EXTI4_IRQn,   5, 0);
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+    HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+    HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 }
 
-/* ────────────────────────────────────────────
-   LED control
-   ──────────────────────────────────────────── */
-void LED_Red(void)
-{
-    HAL_GPIO_WritePin(LED_PORT, GREEN_PIN | YELLOW_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_PORT, RED_PIN,                GPIO_PIN_SET);
-}
-
-void LED_Yellow(void)
-{
-    HAL_GPIO_WritePin(LED_PORT, GREEN_PIN | RED_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_PORT, YELLOW_PIN,          GPIO_PIN_SET);
-}
-
-void LED_Green(void)
-{
-    HAL_GPIO_WritePin(LED_PORT, RED_PIN | YELLOW_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_PORT, GREEN_PIN,             GPIO_PIN_SET);
-}
-
-/* ────────────────────────────────────────────
-   Get remaining seconds from TIM2 directly
-   Perfectly synced — same timer as the light
-   ──────────────────────────────────────────── */
-uint8_t Get_Remaining_Seconds(void)
-{
-    uint32_t elapsed_ms   = __HAL_TIM_GET_COUNTER(&htim2);
-    uint32_t remaining_ms = (current_phase_ms > elapsed_ms)
-                            ? (current_phase_ms - elapsed_ms)
-                            : 0;
-    return (uint8_t)(remaining_ms / 1000);
-}
-
-/* ────────────────────────────────────────────
-   Main
-   ──────────────────────────────────────────── */
+/* ============================================================ */
+/*  Main state machine                                          */
+/* ============================================================ */
 int main(void)
 {
     HAL_Init();
     SystemClock_Config();
-    GPIO_Init();
-    TIM2_Init();
+    DWT_Init();
+    GPIO_Init_All();
 
-    /* Start on RED */
-    LED_Red();
-    traffic = ReadTraffic();
-    Timer_Start(RED_DURATION);
+    all_red();
 
-    uint8_t last_sec = 0xFF;    /* Track last displayed second to avoid
-                                   redundant GPIO writes                   */
+    uint8_t dir = DIR_N;
 
     while (1)
     {
-        /* ── Update 7-seg display from TIM2 counter ── */
-        uint8_t remaining = Get_Remaining_Seconds();
-        if (remaining != last_sec) {
-            last_sec = remaining;
-            SEG_Display(remaining % 10);
+        /* ---- RED phase: sample sensors, honor pedestrian extend ---- */
+        all_red();
+
+        /* Cross-direction control: sensors on the opposite lane decide
+         * this lane's green duration (N<->S, E<->W). */
+        uint8_t sense_dir = (dir + 2u) % NUM_DIRS;
+        uint8_t blocked   = read_sensor_pair(sense_dir);
+        uint32_t green_ms = green_duration(blocked);
+
+        /* Pedestrian sequence:
+         *   Phase 1 (2 s): YELLOW blink   -> request acknowledged
+         *   Phase 2 (2 s): RED    blink   -> pedestrian walk window
+         * RED gap then runs normally before GREEN. */
+        if (ped_pending[dir]) {
+            ped_pending[dir] = 0;
+
+            pin_write(LED_RED[dir], GPIO_PIN_RESET);
+            uint32_t t = HAL_GetTick();
+            while ((HAL_GetTick() - t) < 2000u) {
+                pin_write(LED_YEL[dir], GPIO_PIN_SET);
+                HAL_Delay(250);
+                pin_write(LED_YEL[dir], GPIO_PIN_RESET);
+                HAL_Delay(250);
+            }
+
+            t = HAL_GetTick();
+            while ((HAL_GetTick() - t) < 2000u) {
+                pin_write(LED_RED[dir], GPIO_PIN_SET);
+                HAL_Delay(250);
+                pin_write(LED_RED[dir], GPIO_PIN_RESET);
+                HAL_Delay(250);
+            }
+            pin_write(LED_RED[dir], GPIO_PIN_SET);   /* steady red for the gap */
         }
 
-        /* ── TIM2 expired → advance light state ── */
-        if (timer_expired)
-        {
-            timer_expired = 0;
-            last_sec      = 0xFF;   /* Force display refresh on new phase  */
+        uint32_t t_start = HAL_GetTick();
+        while ((HAL_GetTick() - t_start) < RED_MS) { }
 
-            if (current_light == LIGHT_RED)
-            {
-                uint32_t green_time;
-                if      (traffic == HIGH_TRAFFIC) green_time = GREEN_HEAVY;
-                else if (traffic == LOW_TRAFFIC)  green_time = GREEN_LOW;
-                else                              green_time = GREEN_NORMAL;
-
-                current_light = LIGHT_GREEN;
-                LED_Green();
-                Timer_Start(green_time);
-            }
-            else if (current_light == LIGHT_GREEN)
-            {
-                current_light = LIGHT_YELLOW;
-                LED_Yellow();
-                Timer_Start(YELLOW_DURATION);
-            }
-            else if (current_light == LIGHT_YELLOW)
-            {
-                current_light = LIGHT_RED;
-                LED_Red();
-                traffic = ReadTraffic();
-                Timer_Start(RED_DURATION);
-            }
+        /* ---- GREEN phase ----
+         * Blink GREEN at 1 Hz for the whole phase. Count the blinks:
+         *   5 = normal, 7 = low traffic, 9 = heavy traffic. */
+        pin_write(LED_RED[dir], GPIO_PIN_RESET);
+        pin_write(LED_YEL[dir], GPIO_PIN_RESET);
+        uint32_t blinks = green_ms / 1000u;
+        for (uint32_t i = 0; i < blinks; i++) {
+            pin_write(LED_GRN[dir], GPIO_PIN_SET);
+            HAL_Delay(500);
+            pin_write(LED_GRN[dir], GPIO_PIN_RESET);
+            HAL_Delay(500);
         }
+
+        /* ---- YELLOW phase ---- */
+        set_light(dir, LIGHT_YELLOW);
+        t_start = HAL_GetTick();
+        while ((HAL_GetTick() - t_start) < YELLOW_MS) { }
+
+        dir = (dir + 1u) % NUM_DIRS;
     }
 }
 
-/* ────────────────────────────────────────────
-   System Clock Configuration
-   ──────────────────────────────────────────── */
+/* ============================================================ */
+/*  Interrupt handlers                                          */
+/* ============================================================ */
+static void handle_button(uint16_t pin)
+{
+    for (uint8_t d = 0; d < NUM_DIRS; d++) {
+        if (BTN[d].pin == pin) { ped_pending[d] = 1; return; }
+    }
+}
+
+void EXTI0_IRQHandler(void)   { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0); }
+void EXTI1_IRQHandler(void)   { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_1); }
+void EXTI4_IRQHandler(void)   { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_4); }
+void EXTI9_5_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_8); }
+
+void HAL_GPIO_EXTI_Callback(uint16_t pin) { handle_button(pin); }
+
+/* ============================================================ */
+/*  Clocks / fault handler                                      */
+/* ============================================================ */
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -425,14 +383,7 @@ void SystemClock_Config(void)
     if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) { Error_Handler(); }
 }
 
-/* ────────────────────────────────────────────
-   Error Handler
-   ──────────────────────────────────────────── */
-void Error_Handler(void)
-{
-    __disable_irq();
-    while (1) {}
-}
+void Error_Handler(void) { __disable_irq(); while (1) {} }
 
 #ifdef USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line) {}

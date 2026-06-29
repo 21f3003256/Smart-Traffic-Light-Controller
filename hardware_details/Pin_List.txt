@@ -1,0 +1,120 @@
+═══════════════════════════════════════════════════════════════════════
+  4-WAY TRAFFIC MANAGEMENT SYSTEM — NUCLEO-F446RE PIN LIST  (rev 2)
+═══════════════════════════════════════════════════════════════════════
+
+Directions: N (North), E (East), S (South), W (West)
+
+Header legend:
+  CN5  = Arduino D8..D15      (outer header, top-right)
+  CN6  = Arduino power        (not GPIO)
+  CN7  = Morpho left-odd      (inner-left header)
+  CN8  = Arduino A0..A5       (outer header, bottom-right)
+  CN9  = Arduino D0..D7       (outer header, bottom-right)
+  CN10 = Morpho right         (inner-right header)
+
+───────────────────────────────────────────────────────────────────────
+  Cytron Traffic Light Module (R / Y / G per direction)
+  All 12 LEDs on Arduino headers, 3 adjacent pins per direction.
+  Wire one 3-conductor ribbon per traffic module.
+───────────────────────────────────────────────────────────────────────
+  Direction │  RED       │  YELLOW    │  GREEN     │  Note
+  ──────────┼────────────┼────────────┼────────────┼──────────────────
+  N         │ PA7  (D11) │ PA6  (D12) │ PA5  (D13) │ PA5 = onboard LD2
+  E         │ PB6  (D10) │ PC7  (D9 ) │ PA9  (D8 ) │
+  S         │ PA8  (D7 ) │ PB10 (D6 ) │ PB4  (D5 ) │
+  W         │ PB5  (D4 ) │ PB3  (D3 ) │ PA10 (D2 ) │ PB3 = SWO (debug)
+
+───────────────────────────────────────────────────────────────────────
+  Multiplexed 7-Segment Displays (common cathode, direct GPIO drive)
+  Segments a..g are a SHARED 7-line bus, 330 Ω per segment, fanned out
+  to all 4 displays. Each digit's common cathode goes to its select pin
+  (active LOW). See note on current limits below.
+───────────────────────────────────────────────────────────────────────
+  Segments  │ a    │ b    │ c    │ d    │ e    │ f    │ g
+            │ PC0  │ PC1  │ PC2  │ PC3  │ PC4  │ PC5  │ PC6
+  Header    │ CN8  │ CN8  │ CN7  │ CN7  │ CN10 │ CN10 │ CN10
+            │ (A5) │ (A4) │ mor  │ mor  │ mor  │ mor  │ mor
+
+  Digit selects (active LOW direct cathode, contiguous on CN10/CN7):
+  Direction │ N    │ E    │ S    │ W
+            │ PC8  │ PC9  │ PC10 │ PC11
+  Header    │ CN10 │ CN5  │ CN7  │ CN7
+            │ mor  │ (PC9)│ mor  │ mor
+
+  Current note: at 330 Ω/seg + 3.3 V, peak cathode sink ~28 mA on "8"
+  (just over STM32 25 mA/pin spec). Acceptable for testing; add NPN
+  drivers (2N3904 + 1 kΩ base R) for final build and invert select
+  polarity back to active HIGH.
+
+───────────────────────────────────────────────────────────────────────
+  Pedestrian Push Buttons (active HIGH, internal pulldown, EXTI rising)
+  All 4 on Arduino headers; each on its own unique EXTI line.
+───────────────────────────────────────────────────────────────────────
+  Direction │ Pin       │ EXTI line │ IRQ handler      │ Note
+  ──────────┼───────────┼───────────┼──────────────────┼────────────
+  N         │ PA0  (A0) │ EXTI0     │ EXTI0_IRQn       │
+  E         │ PA1  (A1) │ EXTI1     │ EXTI1_IRQn       │
+  S         │ PA4  (A2) │ EXTI4     │ EXTI4_IRQn       │
+  W         │ PB8  (D15)│ EXTI9_5   │ EXTI9_5_IRQn     │ shared 5..9
+
+  Wiring: button between pin and +3V3; firmware enables internal
+  pulldown. No debounce; soft-debounce in EXTI handler if needed.
+
+───────────────────────────────────────────────────────────────────────
+  HC-SR04 Ultrasonic Sensors (2 per direction, 8 total)
+  SHARED TRIG: all 8 sensors' TRIG pins tied to ONE STM32 pin (PB0).
+  ECHO pins are independent. Polled during each direction's RED phase.
+───────────────────────────────────────────────────────────────────────
+  Shared TRIG : PB0 (A3, CN8 Arduino)
+
+  Direction │ ECHO near       │ ECHO far
+  ──────────┼─────────────────┼─────────────────
+  N         │ PB7  (CN7 mor)  │ PC12 (CN7 mor)
+  E         │ PB12 (CN10 mor) │ PB13 (CN10 mor)
+  S         │ PB14 (CN10 mor) │ PB15 (CN10 mor)
+  W         │ PA11 (CN10 mor) │ PA12 (CN10 mor)
+
+  Note: PB11 is NOT bonded out on the F446RE LQFP64 package (NC on CN10
+  where the L476RG would expose it). N far ECHO uses PC12 instead — sits
+  next to N near on CN7. PB12..PB15 still form a contiguous CN10 block.
+
+───────────────────────────────────────────────────────────────────────
+  Reserved / Do NOT wire to
+───────────────────────────────────────────────────────────────────────
+  PA13, PA14   — SWD debug (ST-LINK) — required for programming
+  PA2, PA3     — ST-LINK VCP UART    — leave free for serial debug
+  PC13         — onboard USER BUTTON (B1)  -> would pollute echo reads
+  PC14, PC15   — Low-speed crystal
+  PA5          — onboard USER LED   (LD2)  -> N GREEN mirrored here
+  PB3          — SWO trace          -> used as W YELLOW (SWO unavailable)
+
+───────────────────────────────────────────────────────────────────────
+  TOTAL PIN COUNT
+───────────────────────────────────────────────────────────────────────
+  Traffic LEDs    : 12 pins (4 × 3)            [all Arduino]
+  7-seg segments  :  7 pins (PC0..PC6 shared)  [2 Arduino + 5 morpho]
+  7-seg selects   :  4 pins (PC8..PC11)        [morpho]
+  Pedestrian btns :  4 pins                    [all Arduino]
+  Ultrasonic TRIG :  1 pin  (PB0 shared)       [Arduino]
+  Ultrasonic ECHO :  8 pins (PB7,12,13,14,15,PA11,PA12,PC12) [morpho]
+  ─────────────────────────────
+  TOTAL           : 36 pins  (19 Arduino + 17 morpho)
+
+───────────────────────────────────────────────────────────────────────
+  THRESHOLDS & DURATIONS (defined in main.c)
+───────────────────────────────────────────────────────────────────────
+  SENSOR_THRESHOLD_CM    = 10 cm
+  GREEN_NORMAL_MS        = 5000   (0 sensors blocked)
+  GREEN_LOW_MS           = 7000   (1 sensor  blocked)
+  GREEN_HEAVY_MS         = 9000   (2 sensors blocked)
+  YELLOW_MS              = 3000
+  RED_MS                 = 2000   (all-red safety gap)
+  PED_EXTEND_MS          = 3000   (added to RED if button was pressed)
+
+───────────────────────────────────────────────────────────────────────
+  CYCLE ORDER
+───────────────────────────────────────────────────────────────────────
+  N → E → S → W → N → ...
+  Per direction: RED (read sensors) → GREEN → YELLOW → advance
+  All non-active directions are held at RED.
+  Multiplex refresh runs in TIM2 ISR @ 1 kHz independent of state.
