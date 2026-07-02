@@ -4,6 +4,8 @@ Smart Adaptive traffic light system for a four-way junction is implemented that 
 REPORT and VIDEO can be viewed at: 
 https://github.com/21f3003256/Smart-Traffic-Light-Controller/tree/main/milestones/<milestone_num>
 
+Project Demonstration has been given at https://www.youtube.com/watch?v=iuQci4bm_ME&t=2s
+
 #Team Members: 
 Jiong Sin 
 Chun Yee
